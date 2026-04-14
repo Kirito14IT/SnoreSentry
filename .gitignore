@@ -1,0 +1,54 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*.tmp
+*.temp
+*.bak
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+*.sqlite
+*.sqlite3
+
+# Node / frontend build
+frontend/node_modules/
+frontend/dist/
+frontend/.idea/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Backend local / generated
+backend/__pycache__/
+backend/.idea/
+backend/radar_monitor.db
+backend/radar_front_sql_embed/
+backend/trained_models/
+
+# RRT / embedded generated artifacts
+Edgi_Talk_M55_XiaoZhi/.settings/
+Edgi_Talk_M55_XiaoZhi/__pycache__/
+Edgi_Talk_M55_XiaoZhi/build/
+Edgi_Talk_M55_XiaoZhi/Debug/
+Edgi_Talk_M55_XiaoZhi/tools/
+Edgi_Talk_M55_XiaoZhi/.sconsign.dblite
+Edgi_Talk_M55_XiaoZhi/rt-thread.elf
+Edgi_Talk_M55_XiaoZhi/rtthread.map
+Edgi_Talk_M55_XiaoZhi/.config.old
+Edgi_Talk_M55_XiaoZhi/libraries/**/docs/
+Edgi_Talk_M55_XiaoZhi/libs/**/docs/
+Edgi_Talk_M55_XiaoZhi/packages/**/docs/
+
+# radar_wifi generated / IDE
+radar_wifi/.idea/
+radar_wifi/.settings/
+radar_wifi/build/
+radar_wifi/.ninja_log
+radar_wifi/library-manager.log

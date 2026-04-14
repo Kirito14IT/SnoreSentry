@@ -1,0 +1,8 @@
+--- a/applications/xiaozhi/ui/xiaozhi_ui.h
++++ b/applications/xiaozhi/ui/xiaozhi_ui.h
+@@
++void xiaozhi_ui_exit_meow_mode_remote(void);
+
+Recovery intent:
+- expose a reusable remote-exit function for backend-issued stop commands
+- avoid routing backend stop through the physical back-button callback
