@@ -191,3 +191,12 @@ What still needs external recovery input:
 
 - the original deleted `xiaozhi` base source files
 - optional original radar algorithm sources if you want byte-for-byte parity with the earlier prototype rather than the recovered compatible API layer
+## Star History
+
+<a href="https://www.star-history.com/?repos=Kirito14IT%2FSnoreSentry&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=Kirito14IT/SnoreSentry&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=Kirito14IT/SnoreSentry&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=Kirito14IT/SnoreSentry&type=date&legend=top-left" />
+ </picture>
+</a>
