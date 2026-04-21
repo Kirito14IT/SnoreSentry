@@ -27,12 +27,6 @@ extern "C" {
 #define XIAOZHI_HOST            "api.tenclass.net"
 #define XIAOZHI_WSPATH          "/xiaozhi/v1/"
 #define XIAOZHI_TOKEN           "Bearer 12345678"
-
-/* Decibel monitor WebSocket server (custom endpoint) */
-#define DECIBEL_HOST            "192.168.31.236"  // Change to your server
-#define DECIBEL_WSPATH          "/snore"
-#define DECIBEL_PORT            8083
-
 #define MAX_WSOCK_HDR_LEN       4096
 #define XZ_MIC_FRAME_LEN        (320 * 6 * 2)
 #define XZ_SPK_FRAME_LEN        (480 * 6)
@@ -115,15 +109,6 @@ typedef struct
     rt_mutex_t ws_write_mutex;  // WebSocket写入互斥锁
 } xiaozhi_ws_t;
 
-/* Decibel monitor WebSocket structure */
-typedef struct
-{
-    wsock_state_t clnt;
-    rt_sem_t sem;
-    uint8_t is_connected;
-    rt_mutex_t ws_write_mutex;
-} decibel_ws_t;
-
 /* Application state structure */
 typedef struct
 {
@@ -135,7 +120,6 @@ typedef struct
     char mac_address_string[MAX_MAC_ADDR_LEN];
     char client_id_string[MAX_CLIENT_ID_LEN];
     xiaozhi_ws_t ws;
-    decibel_ws_t decibel_ws;  /* Decibel monitor WebSocket */
     enum DeviceState state;
     rt_event_t button_event;
     int wakeword_initialized_session;
@@ -202,8 +186,6 @@ int check_internet_access(void);
 char *get_xiaozhi_ws(void);
 int http_xiaozhi_data_parse_ws(char *json_data);
 void xiaozhi_ws_connect(void);
-void decibel_ws_connect(void);
-void decibel_ws_send(uint8_t *data, int len);
 void xiaozhi_entry(void *p);
 int ws_xiaozhi_init(void);
 

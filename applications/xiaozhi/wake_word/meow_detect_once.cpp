@@ -34,6 +34,13 @@
 #include "edge-impulse-sdk/CMSIS/DSP/Include/arm_math.h"
 #include <cmath>  // logf, fabsf
 
+/* --- NEW: For UDP Socket --- */
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h> // for close
+/* --- END NEW --- */
+
 /* Hann window constant */
 #define PI 3.14159265358979323846f
 
@@ -42,20 +49,22 @@
 #define BSP_XIAOZHI_MIC_DEVICE_NAME "mic0"
 #endif
 
-namespace {
-/*
- * PDM driver configuration (same as wakeword).
- */
-#ifdef ENABLE_STEREO_INPUT_FEED
-    #define PDM_FRAME_SAMPLES 320
-    #define PDM_MONO_FRAME_SAMPLES (PDM_FRAME_SAMPLES / 2)
-    #define PDM_IS_STEREO 1
-#else
-    #define PDM_FRAME_SAMPLES 160
-    #define PDM_MONO_FRAME_SAMPLES PDM_FRAME_SAMPLES
-    #define PDM_IS_STEREO 0
+/* --- NEW: Configuration for DB sending --- */
+#ifndef DB_SEND_TARGET_IP
+#define DB_SEND_TARGET_IP "192.168.31.236"  // Replace with your target IP
 #endif
-#define PDM_FRAME_SIZE (PDM_FRAME_SAMPLES * sizeof(int16_t))
+
+#ifndef DB_SEND_TARGET_PORT
+#define DB_SEND_TARGET_PORT 8888           // Replace with your target port
+#endif
+
+#define DB_HISTORY_SIZE 10                 // Store 10 seconds of dB readings
+#define DB_THREAD_STACK_SIZE 2048
+#define DB_THREAD_PRIORITY 20
+#define DB_THREAD_TICK 10
+/* --- END NEW --- */
+
+namespace {
 
 // Board LEDs (from cycfg_pins.h: P16_7 red, P16_6 green, P16_5 blue)
 constexpr int kLedRed = GET_PIN(16, 7);
@@ -102,14 +111,13 @@ constexpr int kOutZeroPoint = -128;
 // DSP params for feature extraction
 constexpr int kFFTSize = 512;
 constexpr int kFFTOutputSize = 257;  // FFT size / 2 + 1
-constexpr int kHopSize = 160;        // 10ms hop @ 16kHz (matches DeepCraft model)
+constexpr int kHopSize = 256;        // 16ms hop @ 16kHz
 constexpr int kNumFrames = 60;       // frames to accumulate (match model)
 constexpr int kMelBins = 20;         // output mel bins
 constexpr int kFeatureSize = 60 * 20; // 1200
 
 // Detection threshold (0.0 ~ 1.0)
-// Threshold for snore detection (logit difference: class1 - class0)
-constexpr float kSnoreThreshold = -0.5f;  // snore if class1 is close to class0
+constexpr float kSnoreThreshold = 0.6f;
 // Cooldown only prevents repeated triggers; lower = more responsive.
 constexpr uint32_t kDetectCooldownMs = 500;
 // Sliding window hop size (in samples). 16000 @16kHz ~= 1000ms.
@@ -122,29 +130,21 @@ static tflite::MicroInterpreter *g_interp = RT_NULL;
 static TfLiteTensor *g_in = RT_NULL;
 static TfLiteTensor *g_out = RT_NULL;
 static rt_tick_t g_last_detect_tick = 0;
-
-/* ── 1-second max score tracking ── */
-static float g_max_score_this_second = -1.0f;
-static rt_tick_t g_score_window_start = 0;
-
-/* ── Decibel monitor (10-second ring buffer) ── */
-#define DECIBEL_BUF_SIZE 10
-static float g_decibel_buf[DECIBEL_BUF_SIZE];
-static uint8_t g_decibel_idx = 0;
-static uint32_t g_decibel_sample_count = 0;
-static float g_decibel_sum = 0.0f;
-static rt_tick_t g_last_decibel_tick = 0;
-
-static rt_thread_t g_meow_tid = RT_NULL;        /* main detect thread (legacy) */
-static rt_thread_t g_mic_tid = RT_NULL;         /* mic read thread */
-static rt_thread_t g_infer_tid = RT_NULL;       /* inference thread */
-static rt_event_t g_meow_event = RT_NULL;       /* detection event */
+static rt_thread_t g_meow_tid = RT_NULL;
 static volatile rt_bool_t g_meow_running = RT_FALSE;
+static rt_thread_t g_db_tid = RT_NULL; // NEW: Thread handle for dB detection
+static volatile rt_bool_t g_db_running = RT_FALSE; // NEW: Flag for dB thread
 static rt_device_t g_mic_dev = RT_NULL;
+static rt_tick_t g_last_db_send_tick = 0; // NEW: Track last send time
+static float g_db_history[DB_HISTORY_SIZE] rt_section(".m33_m55_shared_hyperram"); // NEW: Ring buffer for dB history
+static int g_db_history_index = 0; // NEW: Index for the ring buffer
+static rt_mutex_t g_db_mutex = RT_NULL; // NEW: Mutex to protect access to history and index
+
+/* NEW: Global variables for blue LED blink (moved inside namespace) */
 static rt_tick_t g_blue_blink_until = 0;
 static rt_tick_t g_blue_blink_next_toggle = 0;
 static rt_bool_t g_blue_blink_on = RT_FALSE;
-static uint32_t g_infer_buf_pos = 0;            /* inference buffer position */
+/* END NEW */
 
 /* ── FFT / Mel workspace (static to save stack) ─────────────────────── */
 static arm_rfft_fast_instance_f32 g_fft_inst;
@@ -157,27 +157,31 @@ ALIGN(16) static float g_mel_spectrogram[kNumFrames][kMelBins] rt_section(".m33_
 /* Mel filterbank weights: 20 filters × 257 bins (computed at init) */
 static float g_mel_weights[kMelBins][kFFTOutputSize] rt_section(".m33_m55_shared_hyperram");
 
-/* Triangular filter points (matching DeepCraft model: _K13) */
-static const short g_mel_filter_points[22] = {9, 13, 16, 21, 25, 31, 37, 43, 50, 58, 67, 77, 87, 99, 113, 127, 144, 162, 182, 204, 229, 256};
-
-/* ── Ring buffer for mic_thread → infer_thread (cough_detect style) ── */
-/* Use fixed value 160 (default PDM_FRAME_SAMPLES) to avoid forward reference issue */
-constexpr int kRingBufFrames = 100;                      /* ~100 × 160 = 16000 samples */
-constexpr int kRingBufSamples = kRingBufFrames * PDM_FRAME_SAMPLES;    /* 16000 samples */
-
-static int16_t g_ring_buf[kRingBufSamples] rt_section(".m33_m55_shared_hyperram");
-static uint32_t g_ring_wr = 0;
-static uint32_t g_ring_rd = 0;
-static rt_mutex_t g_ring_mutex = RT_NULL;
-
-/* ── Inference buffer (accumulate samples for Mel spectrogram) ──────── */
-constexpr int kInferWindowSamples = (kNumFrames - 1) * kHopSize + kFFTSize;  /* 15232 samples */
-static int16_t g_infer_buf[kInferWindowSamples] rt_section(".m33_m55_shared_hyperram");
-
 /* Quantization params (cached from tensor) */
 static float g_input_scale = 0.0f;
 static int g_input_zero_point = 0;
 
+/* NEW: Function to calculate RMS and dB */
+static float calculate_db(const int16_t* samples, size_t num_samples) {
+    if (num_samples == 0) return 0.0f;
+
+    double sum_sq = 0.0;
+    for (size_t i = 0; i < num_samples; i++) {
+        double s = (double)samples[i];
+        sum_sq += s * s;
+    }
+    double mean_sq = sum_sq / (double)num_samples;
+    double rms = sqrt(mean_sq);
+
+    // Calculate dB relative to full scale (32768)
+    // Add small epsilon to avoid log(0)
+    float db = 20.0f * log10f((float)rms / 32768.0f + 1e-9f);
+    return db;
+}
+/* END NEW */
+
+
+/* NEW: Function for blue LED blink (moved inside namespace and made static) */
 static void blue_blink_for_ms(uint32_t duration_ms, uint32_t period_ms)
 {
     /* Non-blocking blink: handled in the detect thread loop */
@@ -188,6 +192,8 @@ static void blue_blink_for_ms(uint32_t duration_ms, uint32_t period_ms)
     g_blue_blink_next_toggle = now;
     g_blue_blink_on = RT_FALSE;
 }
+/* END NEW */
+
 
 static void print_tensor_dims(TfLiteTensor *t, const char *name)
 {
@@ -201,7 +207,7 @@ static void print_tensor_dims(TfLiteTensor *t, const char *name)
         rt_kprintf("%d", t->dims->data[i]);
         if (i < dims - 1) rt_kprintf(",");
     }
-    rt_kprintf("], bytes=%d, scale=%.6f, zp=%d\n", (int)t->bytes, t->params.scale, t->params.zero_point);
+    rt_kprintf("], bytes=%d\n", (int)t->bytes);
 }
 
 /* ================================================================
@@ -307,8 +313,8 @@ static int init_model()
         return -RT_ERROR;
     }
 
-    /* Using fixed filter points (DeepCraft model), no need to compute weights */
-    // compute_mel_weights();
+    /* Pre-compute Mel filterbank weights */
+    compute_mel_weights();
 
     LOG_I("init_model: OK");
     return 0;
@@ -371,8 +377,6 @@ static void pcm16_to_int8(const int16_t *pcm, int8_t *dst, size_t n)
     }
 }
 
-
-
 /* ================================================================
  *  Compute one Mel spectrogram frame (20 bins) from 512 samples
  * ================================================================ */
@@ -384,71 +388,26 @@ static void compute_mel_spectrum(const float *samples_512, float *mel_out)
         g_fft_buf[i] = samples_512[i] * w;
     }
 
-    /* Forward Real FFT (output format: [real(dc), imag(dc)=0, real(1), imag(1), ..., real(nyq), imag(nyq)=0]) */
+    /* Forward FFT */
     arm_rfft_fast_f32(&g_fft_inst, g_fft_buf, g_fft_out, 0);
 
-    /* --- CRITICAL FIX: Manually compute magnitude from RFFT output --- */
-    // g_fft_out[0] is DC component (real part)
-    g_magnitude[0] = fabsf(g_fft_out[0]);
-    // g_fft_out[1] is Nyquist component (real part)
-    g_magnitude[kFFTOutputSize - 1] = fabsf(g_fft_out[1]);
-    // For complex bins 1 to kFFTOutputSize-2 (i.e., frequencies 1 to 255)
-    for (int i = 1; i < kFFTOutputSize - 1; i++) {
-        float real_part = g_fft_out[2 * i];
-        float imag_part = g_fft_out[2 * i + 1];
-        g_magnitude[i] = sqrtf(real_part * real_part + imag_part * imag_part);
-    }
-    /* --- END OF FIX --- */
+    /* Compute magnitude spectrum (257 bins) */
+    g_magnitude[0] = fabsf(g_fft_out[0]);  // DC
+    arm_cmplx_mag_f32(&g_fft_out[2], &g_magnitude[1], kFFTSize / 2 - 1);
+    g_magnitude[kFFTOutputSize - 1] = fabsf(g_fft_out[1]);  // Nyquist
 
-        // Check for NaN or Inf in magnitude
-    bool has_nan_or_inf = false;
-    for (int k = 0; k < kFFTOutputSize; k++) {
-        if (isnan(g_magnitude[k]) || isinf(g_magnitude[k])) {
-            has_nan_or_inf = true;
-            LOG_E("Magnitude[%d] is NaN or Inf: %f", k, g_magnitude[k]);
-            break; // Only report the first occurrence
-        }
-    }
-    if (has_nan_or_inf) {
-        LOG_E("FFT Magnitude calculation FAILED!");
-        // Optionally return or set all mel_out to a safe value
-        for (int m = 0; m < kMelBins; m++) {
-            mel_out[m] = 0.0f; // Or some default value
-        }
-        return; // Exit early if magnitude is invalid
-    }
-
-    // Print a few magnitude values and their range
-    float mag_min = g_magnitude[0];
-    float mag_max = g_magnitude[0];
-    for (int k = 0; k < kFFTOutputSize; k++) {
-        if (g_magnitude[k] < mag_min) mag_min = g_magnitude[k];
-        if (g_magnitude[k] > mag_max) mag_max = g_magnitude[k];
-    }
-
-        
-    /* Apply Mel filterbank (DeepCraft triangular filter) */
+    /* Apply Mel filterbank */
     for (int m = 0; m < kMelBins; m++) {
-        short n0 = g_mel_filter_points[m];
-        short n1 = g_mel_filter_points[m + 1];
-        short n2 = g_mel_filter_points[m + 2];
-        short c0 = n1 - n0;
-        short c1 = n2 - n1;
         float sum = 0.0f;
-
-        // Rising part: n0 to n1 (triangular, increasing)
-        for (int i = 0; i <= c0; i++) {
-            float rate = (float)i / (float)c0;
-            sum += g_magnitude[i + n0] * rate;
+        for (int k = 0; k < kFFTOutputSize; k++) {
+            sum += g_magnitude[k] * g_mel_weights[m][k];
         }
-
-        // Falling part: n1 to n2 (triangular, decreasing)
-        for (int i = 1; i <= c1; i++) {
-            float rate = (float)i / (float)c1;
-            sum += g_magnitude[i + n1] * (1.0f - rate);
-        }
-
-        mel_out[m] = logf(sum + 1e-6f);
+        /* Log output: ln(sum + eps) */
+        float v = logf(sum + 1e-6f);
+        /* Clip to reasonable range */
+        if (v < -10.0f) v = -10.0f;
+        if (v > 2.0f) v = 2.0f;
+        mel_out[m] = v;
     }
 }
 
@@ -461,7 +420,19 @@ static inline int8_t quantize_f32(float value)
     return clamp_i8(q);
 }
 
-
+/*
+ * PDM driver configuration (same as wakeword).
+ */
+#ifdef ENABLE_STEREO_INPUT_FEED
+    #define PDM_FRAME_SAMPLES 320
+    #define PDM_MONO_FRAME_SAMPLES (PDM_FRAME_SAMPLES / 2)
+    #define PDM_IS_STEREO 1
+#else
+    #define PDM_FRAME_SAMPLES 160
+    #define PDM_MONO_FRAME_SAMPLES PDM_FRAME_SAMPLES
+    #define PDM_IS_STEREO 0
+#endif
+#define PDM_FRAME_SIZE (PDM_FRAME_SAMPLES * sizeof(int16_t))
 
 } // namespace
 
@@ -492,10 +463,6 @@ static int meow_infer_from_pcm(const int16_t *pcm, float *out_score, rt_bool_t *
         LOG_E("Unexpected input type: %d", g_in->type);
         return -RT_ERROR;
     }
-
-    // Debug: Print output tensor type and quant params (moved before input processing)
-    LOG_I("infer: output type=%d, bytes=%d", g_out->type, (int)g_out->bytes);
-    LOG_I("infer: output quant: scale=%.8f, zp=%d", g_out->params.scale, g_out->params.zero_point);
 
     if (g_in->bytes != kExpectedInputBytes) {
         LOG_E("Input bytes mismatch: expected=%d, got=%d",
@@ -538,125 +505,50 @@ static int meow_infer_from_pcm(const int16_t *pcm, float *out_score, rt_bool_t *
         }
     }
 
-    // Debug: Print samples from throughout the input tensor
-    LOG_I("infer: input[0..4]=%d,%d,%d,%d,%d",
-          g_in->data.int8[0], g_in->data.int8[1], g_in->data.int8[2],
-          g_in->data.int8[3], g_in->data.int8[4]);
-    LOG_I("infer: input[500..504]=%d,%d,%d,%d,%d",
-          g_in->data.int8[500], g_in->data.int8[501], g_in->data.int8[502],
-          g_in->data.int8[503], g_in->data.int8[504]);
-    LOG_I("infer: input[595..599]=%d,%d,%d,%d,%d (frame 29 last 5)",
-          g_in->data.int8[595], g_in->data.int8[596], g_in->data.int8[597],
-          g_in->data.int8[598], g_in->data.int8[599]);
-    LOG_I("infer: input[1195..1199]=%d,%d,%d,%d,%d (last 5)",
-          g_in->data.int8[1195], g_in->data.int8[1196], g_in->data.int8[1197],
-          g_in->data.int8[1198], g_in->data.int8[1199]);
-
     if (g_interp->Invoke() != kTfLiteOk)
     {
         LOG_E("Invoke failed");
         return -RT_ERROR;
     }
 
-    /* ── Read output AFTER inference ─────────────────────────────── */
-    // Support both int8 and float output tensors
-    float out0, out1;
-    if (g_out->type == kTfLiteFloat32) {
-        out0 = g_out->data.f[0];
-        out1 = g_out->data.f[1];
-        LOG_I("infer: output (float): out0=%.6f, out1=%.6f", out0, out1);
-    } else if (g_out->type == kTfLiteInt8) {
-        // Model output: [1,2] int8 quantized
-        // Class 0: non-snore, Class 1: snore
-        // Must use int8 and dequantize
-        const int8_t out_q0 = g_out->data.int8[0];
-        const int8_t out_q1 = g_out->data.int8[1];
-        const float out_scale = g_out->params.scale;
-        const float out_zp = (float)g_out->params.zero_point;
-
-        // Debug: Print raw output tensor bytes
-        LOG_I("infer: raw output bytes[0..1]=%d,%d",
-              g_out->data.int8[0], g_out->data.int8[1]);
-
-        // Dequantize: float = (int8 - zero_point) * scale
-        out0 = (out_q0 - out_zp) * out_scale;
-        out1 = (out_q1 - out_zp) * out_scale;
-
-        LOG_I("infer: out_quant: scale=%.8f, zp=%.1f, raw_q[0]=%d, q[1]=%d",
-              out_scale, out_zp, out_q0, out_q1);
-        LOG_I("infer: dequant: out0=%.6f, out1=%.6f", out0, out1);
-    } else {
-        LOG_E("Unsupported output type: %d", g_out->type);
-        return -RT_ERROR;
-    }
-
     /* Debug: print input data values (first 10) */
-    // Print first few values of the first Mel spectrogram frame (unquantized floats)
-    LOG_I("infer: mel[0][0..4]=%.6f,%.6f,%.6f,%.6f,%.6f",
-        g_mel_spectrogram[0][0], g_mel_spectrogram[0][1], g_mel_spectrogram[0][2],
-        g_mel_spectrogram[0][3], g_mel_spectrogram[0][4]);
+    LOG_I("infer: input[0..9]=%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
+          g_in->data.int8[0], g_in->data.int8[1], g_in->data.int8[2],
+          g_in->data.int8[3], g_in->data.int8[4], g_in->data.int8[5],
+          g_in->data.int8[6], g_in->data.int8[7], g_in->data.int8[8], g_in->data.int8[9]);
+    /* Debug: print first frame Mel values (first 3 bins) */
+    LOG_I("infer: mel[0..2]=%.2f,%.2f,%.2f",
+          g_mel_spectrogram[0][0], g_mel_spectrogram[0][1], g_mel_spectrogram[0][2]);
 
-    // Print first few values of the model input tensor (quantized ints)
-    LOG_I("infer: input[0..4]=%d,%d,%d,%d,%d",
-        g_in->data.int8[0], g_in->data.int8[1], g_in->data.int8[2],
-        g_in->data.int8[3], g_in->data.int8[4]);
+    // Model output: [1,2] - class 0: unlabelled, class 1: snore, class 2: noise
+    // Use class 1 (snore) probability
+    const int8_t out0 = g_out->data.int8[0];
+    const int8_t out1 = g_out->data.int8[1];
+    const float snore_score = ((int)out1 - kOutZeroPoint) * kOutScale;
 
-    // Print min/max of the first frame's Mel values (to check range before quantization)
-    float min_mel = g_mel_spectrogram[0][0];
-    float max_mel = g_mel_spectrogram[0][0];
-    for (int b = 1; b < kMelBins; b++) {
-        if (g_mel_spectrogram[0][b] < min_mel) min_mel = g_mel_spectrogram[0][b];
-        if (g_mel_spectrogram[0][b] > max_mel) max_mel = g_mel_spectrogram[0][b];
-    }
-    LOG_I("infer: mel[0] range: min=%.6f, max=%.6f", min_mel, max_mel);
+    LOG_I("infer: output[0]=%d, output[1]=%d, snore=%.3f",
+          (int)out0, (int)out1, snore_score);
 
-    // Print quantization parameters being used
-    LOG_I("infer: quant_params: scale=%.8f, zp=%d", g_input_scale, g_input_zero_point);
-
-    // Model outputs raw logits (not softmax probabilities)
-    // Dequantized values are direct class scores
-    // Use out1 - out0 as the snore score (logit difference)
-    const float snore_score = out1 - out0;  // Logit difference
-
-    LOG_I("infer: snore_score=%.6f (class0=%.6f, class1=%.6f)", snore_score, out0, out1);
-
-    /* ── Track max score within 1-second window ── */
     const rt_tick_t now = rt_tick_get();
-    if (g_score_window_start == 0) g_score_window_start = now;
-
-    // Reset window every 1 second
-    if (now - g_score_window_start >= RT_TICK_PER_SECOND) {
-        LOG_I("infer: 1s max score = %.6f", g_max_score_this_second);
-        g_max_score_this_second = -1.0f;
-        g_score_window_start = now;
-    }
-
-    // Update max score
-    if (snore_score > g_max_score_this_second) {
-        g_max_score_this_second = snore_score;
-    }
-
     const rt_bool_t cooldown_ok = (g_last_detect_tick == 0) ||
                                   ((now - g_last_detect_tick) >= rt_tick_from_millisecond(kDetectCooldownMs));
 
-    // Use max score within 1 second for detection
-    const float detect_score = g_max_score_this_second;
-    const rt_bool_t detected = (detect_score >= kSnoreThreshold && cooldown_ok);
+    const rt_bool_t detected = (snore_score >= kSnoreThreshold && cooldown_ok);
 
     if (detected)
     {
         g_last_detect_tick = now;
-        LOG_W("SNORE DETECTED: 1s_max=%.3f (inst=%.3f) threshold=%.2f", detect_score, snore_score, kSnoreThreshold);
+        LOG_W("SNORE DETECTED: score=%.3f (raw=%d) threshold=%.2f", snore_score, (int)out1, kSnoreThreshold);
     }
     else
     {
-        LOG_I("NO SNORE: 1s_max=%.3f (inst=%.3f) threshold=%.2f%s",
-              detect_score, snore_score, kSnoreThreshold,
-              (detect_score >= kSnoreThreshold && !cooldown_ok) ? " (cooldown)" : "");
+        LOG_I("NO SNORE: score=%.3f (raw=%d) threshold=%.2f%s",
+              snore_score, (int)out1, kSnoreThreshold,
+              (snore_score >= kSnoreThreshold && !cooldown_ok) ? " (cooldown)" : "");
     }
 
     if (out_score)
-        *out_score = detect_score;  // Return the 1-second max
+        *out_score = snore_score;
     if (out_detected)
         *out_detected = detected;
 
@@ -664,161 +556,150 @@ static int meow_infer_from_pcm(const int16_t *pcm, float *out_score, rt_bool_t *
 #endif
 }
 
-/* ── mic_thread: reads PDM frames and pushes to ring buffer ────────────── */
-static void mic_thread_entry(void *param)
+/* NEW: dB detection and sending thread entry point */
+static void db_detect_and_send_thread_entry(void *parameter)
 {
-    (void)param;
-    int16_t frame[PDM_FRAME_SAMPLES];
+    (void)parameter;
+    LOG_I("db: detection and sending thread started");
 
-    LOG_I("snore: mic_thread started");
-
-    while (g_meow_running)
+    g_mic_dev = rt_device_find(BSP_XIAOZHI_MIC_DEVICE_NAME);
+    if (!g_mic_dev)
     {
-        rt_size_t bytes = rt_device_read(g_mic_dev, 0, frame, PDM_FRAME_SIZE);
-        if (bytes != PDM_FRAME_SIZE)
-        {
-            rt_thread_mdelay(1);
-            continue;
-        }
-
-        /* Accumulate samples for decibel calculation */
-        for (int i = 0; i < PDM_FRAME_SAMPLES; i++) {
-            g_decibel_sum += (float)frame[i] * (float)frame[i];
-            g_decibel_sample_count++;
-        }
-
-        /* Push frame into the ring buffer */
-        rt_mutex_take(g_ring_mutex, RT_WAITING_FOREVER);
-        for (int i = 0; i < PDM_FRAME_SAMPLES; i++)
-        {
-            g_ring_buf[g_ring_wr % kRingBufSamples] = frame[i];
-            g_ring_wr++;
-        }
-        rt_mutex_release(g_ring_mutex);
-
-        /* Every 1 second: calculate decibel and send via WebSocket */
-        rt_tick_t now = rt_tick_get();
-        if (g_last_decibel_tick == 0) g_last_decibel_tick = now;
-
-        if (now - g_last_decibel_tick >= RT_TICK_PER_SECOND) {
-            float db = -60.0f;
-            if (g_decibel_sample_count > 0) {
-                float rms = sqrtf(g_decibel_sum / g_decibel_sample_count);
-                if (rms > 1e-6f) {
-                    db = 20.0f * log10f(rms / 32768.0f) + 90.0f;  // Approximate dB SPL
-                }
-            }
-
-            /* Write to ring buffer */
-            g_decibel_buf[g_decibel_idx] = db;
-            g_decibel_idx = (g_decibel_idx + 1) % DECIBEL_BUF_SIZE;
-
-            LOG_I("decibel: %.1f dB", db);
-
-            /* Build and send JSON via WebSocket */
-            char json_buf[256];
-            int pos = rt_snprintf(json_buf, sizeof(json_buf),
-                "{\"timestamp\":%lu,\"decibel_array\":[",
-                (unsigned long)(now / RT_TICK_PER_SECOND + 1700000000));
-
-            for (int i = 0; i < DECIBEL_BUF_SIZE; i++) {
-                int idx = (g_decibel_idx + i) % DECIBEL_BUF_SIZE;
-                pos += rt_snprintf(json_buf + pos, sizeof(json_buf) - pos, "%.1f%s",
-                    g_decibel_buf[idx], (i < DECIBEL_BUF_SIZE - 1) ? "," : "");
-            }
-            pos += rt_snprintf(json_buf + pos, sizeof(json_buf) - pos, "]}");
-
-            /* Send via dedicated decibel WebSocket */
-            extern void decibel_ws_send(uint8_t *data, int len);
-            decibel_ws_send((uint8_t*)json_buf, pos);
-
-            /* Reset accumulators */
-            g_decibel_sum = 0.0f;
-            g_decibel_sample_count = 0;
-            g_last_decibel_tick = now;
-        }
+        LOG_E("db: cannot find audio device '%s'", BSP_XIAOZHI_MIC_DEVICE_NAME);
+        g_db_running = RT_FALSE;
+        g_db_tid = RT_NULL;
+        return;
     }
 
-    LOG_I("snore: mic_thread exiting");
+    if (rt_device_open(g_mic_dev, RT_DEVICE_FLAG_RDONLY) != RT_EOK)
+    {
+        LOG_E("db: cannot open audio device");
+        g_mic_dev = RT_NULL;
+        g_db_running = RT_FALSE;
+        g_db_tid = RT_NULL;
+        return;
+    }
+
+    // Create UDP socket
+    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd < 0) {
+        LOG_E("db: cannot create UDP socket, errno=%d", errno);
+        rt_device_close(g_mic_dev);
+        g_mic_dev = RT_NULL;
+        g_db_running = RT_FALSE;
+        g_db_tid = RT_NULL;
+        return;
+    }
+
+    struct sockaddr_in serv_addr;
+    memset(&serv_addr, 0, sizeof(serv_addr));
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(DB_SEND_TARGET_PORT);
+    if (inet_aton(DB_SEND_TARGET_IP, &serv_addr.sin_addr) == 0) {
+        LOG_E("db: invalid target IP address: %s", DB_SEND_TARGET_IP);
+        close(sockfd);
+        rt_device_close(g_mic_dev);
+        g_mic_dev = RT_NULL;
+        g_db_running = RT_FALSE;
+        g_db_tid = RT_NULL;
+        return;
+    }
+
+    // Initialize ring buffer
+    for (int i = 0; i < DB_HISTORY_SIZE; i++) {
+        g_db_history[i] = -999.0f; // A clearly invalid dB value
+    }
+
+    // Calculate number of samples per second (16000)
+    const size_t samples_per_second = kSampleRate; // 16000
+    // Calculate number of PDM frames needed per second
+    const size_t pdm_frames_per_second = (samples_per_second + PDM_FRAME_SAMPLES - 1) / PDM_FRAME_SAMPLES; // Ceiling division
+    const size_t pdm_frames_per_iteration = pdm_frames_per_second; // Send every second
+
+    LOG_I("db: sending to %s:%d, frames_per_iter=%d", DB_SEND_TARGET_IP, DB_SEND_TARGET_PORT, (int)pdm_frames_per_iteration);
+
+    int16_t pdm_frame[PDM_FRAME_SAMPLES];
+    static int16_t temp_buffer[samples_per_second] rt_section(".m33_m55_shared_hyperram"); // Buffer for 1 second of samples
+    size_t temp_idx = 0;
+
+    while (g_db_running)
+    {
+        // Collect 1 second worth of samples
+        size_t collected_frames = 0;
+        while (collected_frames < pdm_frames_per_iteration && g_db_running)
+        {
+            const rt_size_t read_size = rt_device_read(g_mic_dev, 0, pdm_frame, PDM_FRAME_SIZE);
+            if (read_size == 0)
+            {
+                rt_thread_mdelay(1);
+                continue;
+            }
+
+            const size_t total_samples = read_size / sizeof(int16_t);
+#if PDM_IS_STEREO
+            const size_t mono_samples = total_samples / 2;
+            for (size_t i = 0; i < mono_samples && temp_idx < samples_per_second; i++)
+            {
+                temp_buffer[temp_idx++] = pdm_frame[i * 2 + 1]; // right channel
+            }
+#else
+            for (size_t i = 0; i < total_samples && temp_idx < samples_per_second; i++)
+            {
+                temp_buffer[temp_idx++] = pdm_frame[i];
+            }
+#endif
+
+            collected_frames++;
+        }
+
+        if (!g_db_running || temp_idx == 0) {
+             if(temp_idx == 0) {
+                 LOG_D("db: No samples collected, skipping calculation.");
+             }
+             break; // Exit if stopped or no samples
+        }
+
+        // Calculate dB for the collected second
+        float current_db = calculate_db(temp_buffer, temp_idx);
+        LOG_D("db: calculated %.2f dB for %d samples", current_db, (int)temp_idx); // Debug log
+
+        // Acquire mutex before modifying shared data
+        if (g_db_mutex) rt_mutex_take(g_db_mutex, RT_WAITING_FOREVER);
+
+        // Add to history ring buffer
+        g_db_history[g_db_history_index] = current_db;
+        g_db_history_index = (g_db_history_index + 1) % DB_HISTORY_SIZE;
+
+        // Release mutex
+        if (g_db_mutex) rt_mutex_release(g_db_mutex);
+
+        // Prepare message string (e.g., "dB: -45.23")
+        char msg_str[64];
+        snprintf(msg_str, sizeof(msg_str), "dB: %.2f", current_db);
+
+        // Send UDP packet
+        ssize_t sent = sendto(sockfd, msg_str, strlen(msg_str), 0,
+                              (struct sockaddr*)&serv_addr, sizeof(serv_addr));
+        if (sent < 0) {
+            LOG_E("db: sendto failed, errno=%d", errno);
+        } else {
+            LOG_D("db: sent UDP: %s", msg_str); // Debug log
+        }
+
+        // Reset temp buffer index for next iteration
+        temp_idx = 0;
+    }
+
+    close(sockfd);
+    if (g_mic_dev) {
+        rt_device_close(g_mic_dev);
+        g_mic_dev = RT_NULL;
+    }
+    LOG_I("db: detection and sending thread exiting");
+    g_db_tid = RT_NULL;
 }
+/* END NEW */
 
-/* ── infer_thread: accumulates audio and runs Mel spectrogram inference ── */
-static void infer_thread_entry(void *param)
-{
-    (void)param;
-    int16_t frame[PDM_FRAME_SAMPLES];
-    g_infer_buf_pos = 0;
-
-    LOG_I("snore: infer_thread started");
-
-    /* Wait for model to be initialized (done by main thread) */
-    while (!g_interp)
-    {
-        if (!g_meow_running) goto exit;
-        rt_thread_mdelay(10);
-    }
-
-    while (g_meow_running)
-    {
-        /* Check available samples in ring buffer */
-        rt_mutex_take(g_ring_mutex, RT_WAITING_FOREVER);
-        uint32_t avail = g_ring_wr - g_ring_rd;
-        rt_mutex_release(g_ring_mutex);
-
-        if (avail < PDM_FRAME_SAMPLES)
-        {
-            rt_thread_mdelay(5);
-            continue;
-        }
-
-        /* Copy one frame out of the ring buffer */
-        rt_mutex_take(g_ring_mutex, RT_WAITING_FOREVER);
-        for (int i = 0; i < PDM_FRAME_SAMPLES; i++)
-        {
-            frame[i] = g_ring_buf[g_ring_rd % kRingBufSamples];
-            g_ring_rd++;
-        }
-        rt_mutex_release(g_ring_mutex);
-
-        /* Accumulate into inference buffer */
-        if (g_infer_buf_pos + PDM_FRAME_SAMPLES <= kInferWindowSamples)
-        {
-            for (int i = 0; i < PDM_FRAME_SAMPLES; i++)
-            {
-                g_infer_buf[g_infer_buf_pos + i] = frame[i];
-            }
-            g_infer_buf_pos += PDM_FRAME_SAMPLES;
-        }
-
-        /* Trigger inference when buffer is full */
-        if (g_infer_buf_pos + PDM_FRAME_SAMPLES > kInferWindowSamples)
-        {
-            /* Zero-pad if needed */
-            if (g_infer_buf_pos < kInferWindowSamples)
-            {
-                rt_memset(&g_infer_buf[g_infer_buf_pos], 0,
-                          (kInferWindowSamples - g_infer_buf_pos) * sizeof(int16_t));
-            }
-
-            /* Run inference */
-            float score = 0.0f;
-            rt_bool_t detected = RT_FALSE;
-            int ret = meow_infer_from_pcm(g_infer_buf, &score, &detected);
-
-            if (ret == RT_EOK && detected)
-            {
-                /* Send detection event */
-                rt_event_send(g_meow_event, 0x01);
-            }
-
-            /* Reset for next window */
-            g_infer_buf_pos = 0;
-        }
-    }
-
-exit:
-    LOG_I("snore: infer_thread exiting");
-}
 
 #define MEOW_THREAD_STACK_SIZE 4096
 #define MEOW_THREAD_PRIORITY   18
@@ -828,11 +709,11 @@ static void meow_detect_thread_entry(void *parameter)
 {
     (void)parameter;
 
-    LOG_I("snore: sliding window started (2s window, hop=%d samples)", (int)kHopSamples);
+    LOG_I("meow: sliding window started (2s window, hop=%d samples)", (int)kHopSamples);
 
     if (init_model() != 0)
     {
-        LOG_E("snore: init_model failed");
+        LOG_E("meow: init_model failed");
         g_meow_running = RT_FALSE;
         g_meow_tid = RT_NULL;
         return;
@@ -844,7 +725,7 @@ static void meow_detect_thread_entry(void *parameter)
     g_mic_dev = rt_device_find(BSP_XIAOZHI_MIC_DEVICE_NAME);
     if (!g_mic_dev)
     {
-        LOG_E("snore: cannot find audio device '%s'", BSP_XIAOZHI_MIC_DEVICE_NAME);
+        LOG_E("meow: cannot find audio device '%s'", BSP_XIAOZHI_MIC_DEVICE_NAME);
         g_meow_running = RT_FALSE;
         g_meow_tid = RT_NULL;
         return;
@@ -852,14 +733,13 @@ static void meow_detect_thread_entry(void *parameter)
 
     if (rt_device_open(g_mic_dev, RT_DEVICE_FLAG_RDONLY) != RT_EOK)
     {
-        LOG_E("snore: cannot open audio device");
+        LOG_E("meow: cannot open audio device");
         g_mic_dev = RT_NULL;
         g_meow_running = RT_FALSE;
         g_meow_tid = RT_NULL;
         return;
     }
 
-    /* Legacy single-thread mode - kept for compatibility */
     static int16_t ring[kInputSamples] rt_section(".m33_m55_shared_hyperram");
     static int16_t snap[kInputSamples] rt_section(".m33_m55_shared_hyperram");
     int16_t pdm_frame[PDM_FRAME_SAMPLES];
@@ -939,14 +819,14 @@ static void meow_detect_thread_entry(void *parameter)
         int ret = meow_infer_from_pcm(snap, &score, &detected);
         if (ret != RT_EOK)
         {
-            LOG_W("snore: infer failed (%d)", ret);
+            LOG_W("meow: infer failed (%d)", ret);
             continue;
         }
 
         xiaozhi_ui_set_meow_result(detected ? true : false, score);
         if (detected)
         {
-            blue_blink_for_ms(1000, 100);
+            blue_blink_for_ms(1000, 100); // This now calls the function inside the namespace
         }
     }
 
@@ -956,38 +836,42 @@ static void meow_detect_thread_entry(void *parameter)
         g_mic_dev = RT_NULL;
     }
 
-    LOG_I("snore: detect thread exiting");
+    LOG_I("meow: detect thread exiting");
     g_meow_tid = RT_NULL;
 }
 
-/* ── Event handler thread (waits for detection events from infer_thread) ── */
-static void meow_event_thread_entry(void *param)
-{
-    (void)param;
-    rt_uint32_t recv = 0;
-
-    LOG_I("snore: event thread started");
-
-    while (g_meow_running)
-    {
-        rt_err_t ret = rt_event_recv(g_meow_event, 0x01,
-                                      RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR,
-                                      rt_tick_from_millisecond(100), &recv);
-        if (ret != RT_EOK)
-            continue;
-
-        if (recv & 0x01)
-        {
-            LOG_W("SNORE DETECTED via event");
-            xiaozhi_ui_set_meow_result(true, 1.0f);
-            blue_blink_for_ms(1000, 100);
-        }
-    }
-
-    LOG_I("snore: event thread exiting");
-}
-
 extern "C" {
+int meow_detect_stop(void)
+{
+    /* Idempotent stop: always force LED state to "stopped" */
+    g_meow_running = RT_FALSE;
+
+    // Stopped: red on, green off, blue off
+    leds_init_once();
+    led_write(kLedRed, RT_TRUE);
+    led_write(kLedGreen, RT_FALSE);
+    led_write(kLedBlue, RT_FALSE);
+
+    /* NEW: Stop DB thread when main detection stops */
+    if (g_db_running) {
+        g_db_running = RT_FALSE;
+        if (g_db_tid) {
+             // Give thread time to exit gracefully (it checks g_db_running)
+             rt_thread_mdelay(100);
+             // Force delete if still exists
+             if (g_db_tid) {
+                 rt_thread_delete(g_db_tid);
+                 g_db_tid = RT_NULL;
+             }
+        }
+        LOG_I("meow: db thread stopped");
+    }
+    /* END NEW */
+
+    /* Give main thread time to exit; no hard join API on RT-Thread */
+    rt_thread_mdelay(100);
+    return RT_EOK;
+}
 
 int meow_detect_start(void)
 {
@@ -995,67 +879,14 @@ int meow_detect_start(void)
     LOG_E("RT_USING_AUDIO not enabled");
     return -RT_ERROR;
 #else
-    /* Print memory info */
-    {
-        rt_size_t total = 0, used = 0, max_used = 0;
-        rt_memory_info(&total, &used, &max_used);
-        LOG_I("=== Memory Info ===");
-        LOG_I("total: %u KB, used: %u KB, available: %u KB",
-              total / 1024, used / 1024, (total - used) / 1024);
-        LOG_I("ring_buf: %u KB, infer_buf: %u KB",
-              (unsigned)(kRingBufSamples * sizeof(int16_t)) / 1024,
-              (unsigned)(kInferWindowSamples * sizeof(int16_t)) / 1024);
-    }
-
     if (g_meow_running)
     {
-        LOG_I("snore: detect already running");
+        LOG_I("meow: detect already running");
         return RT_EOK;
     }
 
-    /* Initialize model first */
     if (init_model() != 0)
     {
-        return -RT_ERROR;
-    }
-
-    /* Create synchronization objects */
-    g_ring_mutex = rt_mutex_create("meow_rbuf", RT_IPC_FLAG_FIFO);
-    if (!g_ring_mutex)
-    {
-        LOG_E("snore: create ring mutex failed");
-        return -RT_ERROR;
-    }
-
-    g_meow_event = rt_event_create("meow_evt", RT_IPC_FLAG_FIFO);
-    if (!g_meow_event)
-    {
-        LOG_E("snore: create event failed");
-        rt_mutex_delete(g_ring_mutex);
-        g_ring_mutex = RT_NULL;
-        return -RT_ERROR;
-    }
-
-    /* Open microphone device */
-    g_mic_dev = rt_device_find(BSP_XIAOZHI_MIC_DEVICE_NAME);
-    if (!g_mic_dev)
-    {
-        LOG_E("snore: cannot find audio device '%s'", BSP_XIAOZHI_MIC_DEVICE_NAME);
-        rt_event_delete(g_meow_event);
-        rt_mutex_delete(g_ring_mutex);
-        g_meow_event = RT_NULL;
-        g_ring_mutex = RT_NULL;
-        return -RT_ERROR;
-    }
-
-    if (rt_device_open(g_mic_dev, RT_DEVICE_FLAG_RDONLY) != RT_EOK)
-    {
-        LOG_E("snore: cannot open audio device");
-        g_mic_dev = RT_NULL;
-        rt_event_delete(g_meow_event);
-        rt_mutex_delete(g_ring_mutex);
-        g_meow_event = RT_NULL;
-        g_ring_mutex = RT_NULL;
         return -RT_ERROR;
     }
 
@@ -1066,136 +897,84 @@ int meow_detect_start(void)
     led_write(kLedBlue, RT_FALSE);
 
     g_meow_running = RT_TRUE;
-    g_ring_wr = 0;
-    g_ring_rd = 0;
-    g_infer_buf_pos = 0;
 
-    /* Create mic thread */
-    g_mic_tid = rt_thread_create("meow_mic",
-                                  mic_thread_entry,
+    g_meow_tid = rt_thread_create("meow_det",
+                                  meow_detect_thread_entry,
                                   RT_NULL,
-                                  1024 * 2,
+                                  MEOW_THREAD_STACK_SIZE,
                                   MEOW_THREAD_PRIORITY,
-                                  MEOW_THREAD_TICK);
-    if (!g_mic_tid)
-    {
-        LOG_E("snore: create mic thread failed");
-        g_meow_running = RT_FALSE;
-        rt_device_close(g_mic_dev);
-        g_mic_dev = RT_NULL;
-        rt_event_delete(g_meow_event);
-        rt_mutex_delete(g_ring_mutex);
-        g_meow_event = RT_NULL;
-        g_ring_mutex = RT_NULL;
-        return -RT_ENOMEM;
-    }
-
-    /* Create infer thread */
-    g_infer_tid = rt_thread_create("meow_inf",
-                                    infer_thread_entry,
-                                    RT_NULL,
-                                    1024 * 8,
-                                    MEOW_THREAD_PRIORITY - 1,
-                                    MEOW_THREAD_TICK);
-    if (!g_infer_tid)
-    {
-        LOG_E("snore: create infer thread failed");
-        g_meow_running = RT_FALSE;
-        rt_thread_delete(g_mic_tid);
-        g_mic_tid = RT_NULL;
-        rt_device_close(g_mic_dev);
-        g_mic_dev = RT_NULL;
-        rt_event_delete(g_meow_event);
-        rt_mutex_delete(g_ring_mutex);
-        g_meow_event = RT_NULL;
-        g_ring_mutex = RT_NULL;
-        return -RT_ENOMEM;
-    }
-
-    /* Create event handler thread */
-    g_meow_tid = rt_thread_create("meow_evt",
-                                  meow_event_thread_entry,
-                                  RT_NULL,
-                                  1024 * 2,
-                                  MEOW_THREAD_PRIORITY + 1,
                                   MEOW_THREAD_TICK);
     if (!g_meow_tid)
     {
-        LOG_E("snore: create event thread failed");
+        LOG_E("meow: create thread failed");
         g_meow_running = RT_FALSE;
-        rt_thread_delete(g_mic_tid);
-        rt_thread_delete(g_infer_tid);
-        g_mic_tid = RT_NULL;
-        g_infer_tid = RT_NULL;
-        rt_device_close(g_mic_dev);
-        g_mic_dev = RT_NULL;
-        rt_event_delete(g_meow_event);
-        rt_mutex_delete(g_ring_mutex);
-        g_meow_event = RT_NULL;
-        g_ring_mutex = RT_NULL;
         return -RT_ENOMEM;
     }
 
-    /* Start threads */
-    rt_thread_startup(g_mic_tid);
-    rt_thread_startup(g_infer_tid);
     rt_thread_startup(g_meow_tid);
 
-    LOG_I("snore: detect started (dual-thread mode)");
+    /* NEW: Start DB thread when main detection starts */
+    if (!g_db_running && !g_db_tid) {
+        // Create mutex if it doesn't exist
+        if (!g_db_mutex) {
+            g_db_mutex = rt_mutex_create("db_mtx", RT_IPC_FLAG_FIFO);
+            if (!g_db_mutex) {
+                LOG_E("meow: create mutex failed");
+                // Stop the meow thread if mutex creation fails
+                meow_detect_stop(); // Now correctly calls the function defined below within extern "C"
+                return -RT_ENOMEM;
+            }
+        }
+
+        g_db_running = RT_TRUE;
+
+        g_db_tid = rt_thread_create("db_det_snd",
+                                    db_detect_and_send_thread_entry,
+                                    RT_NULL,
+                                    DB_THREAD_STACK_SIZE,
+                                    DB_THREAD_PRIORITY,
+                                    DB_THREAD_TICK);
+        if (!g_db_tid)
+        {
+            LOG_E("meow: create db thread failed");
+            g_db_running = RT_FALSE;
+            // Stop the meow thread if db thread creation fails
+            meow_detect_stop(); // Now correctly calls the function defined below within extern "C"
+            return -RT_ENOMEM;
+        }
+
+        rt_thread_startup(g_db_tid);
+        LOG_I("meow: db thread started alongside main detection");
+    }
+    /* END NEW */
+
     return RT_EOK;
 #endif
 }
 
-int meow_detect_stop(void)
-{
-    /* Idempotent stop: always force LED state to "stopped" */
-    g_meow_running = RT_FALSE;
 
-    /* Wait for threads to exit */
-    if (g_meow_tid)
-    {
-        rt_thread_mdelay(50);
-        g_meow_tid = RT_NULL;
-    }
-    if (g_mic_tid)
-    {
-        rt_thread_mdelay(50);
-        g_mic_tid = RT_NULL;
-    }
-    if (g_infer_tid)
-    {
-        rt_thread_mdelay(50);
-        g_infer_tid = RT_NULL;
+
+/* NEW: Function to get dB history */
+int meow_get_db_history(float* buffer, int size) {
+    if (!buffer || size <= 0 || !g_db_mutex) {
+        return -RT_ERROR;
     }
 
-    /* Close and cleanup */
-    if (g_mic_dev)
-    {
-        rt_device_close(g_mic_dev);
-        g_mic_dev = RT_NULL;
+    rt_mutex_take(g_db_mutex, RT_WAITING_FOREVER);
+
+    int copy_count = (size < DB_HISTORY_SIZE) ? size : DB_HISTORY_SIZE;
+    int start_index = (g_db_history_index - copy_count + DB_HISTORY_SIZE) % DB_HISTORY_SIZE;
+
+    for (int i = 0; i < copy_count; i++) {
+        int src_idx = (start_index + i) % DB_HISTORY_SIZE;
+        buffer[i] = g_db_history[src_idx];
     }
 
-    if (g_meow_event)
-    {
-        rt_event_delete(g_meow_event);
-        g_meow_event = RT_NULL;
-    }
+    rt_mutex_release(g_db_mutex);
 
-    if (g_ring_mutex)
-    {
-        rt_mutex_delete(g_ring_mutex);
-        g_ring_mutex = RT_NULL;
-    }
-
-    // Stopped: red on, green off, blue off
-    leds_init_once();
-    led_write(kLedRed, RT_TRUE);
-    led_write(kLedGreen, RT_FALSE);
-    led_write(kLedBlue, RT_FALSE);
-
-    LOG_I("snore: detect stopped");
-    return RT_EOK;
+    return copy_count; // Return number of values copied
 }
+/* END NEW */
 
 } // extern "C"
 
@@ -1266,12 +1045,31 @@ static int meow_detect_once(void)
 
     xiaozhi_ui_set_meow_result(detected ? true : false, score);
     if (detected)
-        blue_blink_for_ms(1000, 100);
+        blue_blink_for_ms(1000, 100); // This now calls the function inside the namespace
 
     return RT_EOK;
 #endif
 }
 
 MSH_CMD_EXPORT(meow_detect_once, Capture mic0 audio (32000 samples) and run meow model once);
-#endif
 
+/* NEW: FINSH command to get dB history */
+static void get_db_history(int argc, char *argv[])
+{
+    float db_values[DB_HISTORY_SIZE];
+    int count = meow_get_db_history(db_values, DB_HISTORY_SIZE);
+
+    if (count < 0) {
+        rt_kprintf("Failed to get dB history.\n");
+        return;
+    }
+
+    rt_kprintf("Last %d dB readings (oldest to newest):\n", count);
+    for (int i = 0; i < count; i++) {
+        rt_kprintf("  [%2d]: %.2f dB\n", i, db_values[i]);
+    }
+}
+MSH_CMD_EXPORT(get_db_history, Get the last 10 dB readings);
+/* END NEW */
+
+#endif
