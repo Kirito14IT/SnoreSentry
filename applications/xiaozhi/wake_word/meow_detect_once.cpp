@@ -562,6 +562,8 @@ static void db_detect_and_send_thread_entry(void *parameter)
     (void)parameter;
     LOG_I("db: detection and sending thread started");
 
+    rt_tick_t last_send_tick = rt_tick_get();
+
     g_mic_dev = rt_device_find(BSP_XIAOZHI_MIC_DEVICE_NAME);
     if (!g_mic_dev)
     {
@@ -609,12 +611,13 @@ static void db_detect_and_send_thread_entry(void *parameter)
     for (int i = 0; i < DB_HISTORY_SIZE; i++) {
         g_db_history[i] = -999.0f; // A clearly invalid dB value
     }
+    g_db_history_index = 0;
 
     // Calculate number of samples per second (16000)
     const size_t samples_per_second = kSampleRate; // 16000
     // Calculate number of PDM frames needed per second
     const size_t pdm_frames_per_second = (samples_per_second + PDM_FRAME_SAMPLES - 1) / PDM_FRAME_SAMPLES; // Ceiling division
-    const size_t pdm_frames_per_iteration = pdm_frames_per_second; // Send every second
+    const size_t pdm_frames_per_iteration = pdm_frames_per_second; // Process every second's worth of data
 
     LOG_I("db: sending to %s:%d, frames_per_iter=%d", DB_SEND_TARGET_IP, DB_SEND_TARGET_PORT, (int)pdm_frames_per_iteration);
 
@@ -652,11 +655,13 @@ static void db_detect_and_send_thread_entry(void *parameter)
             collected_frames++;
         }
 
-        if (!g_db_running || temp_idx == 0) {
-             if(temp_idx == 0) {
-                 LOG_D("db: No samples collected, skipping calculation.");
-             }
-             break; // Exit if stopped or no samples
+        if (!g_db_running) {
+             break; // Only exit when stopped
+        }
+
+        if (temp_idx == 0) {
+            LOG_D("db: No samples collected, skipping calculation.");
+            continue; // Skip this iteration if no samples
         }
 
         // Calculate dB for the collected second
@@ -666,28 +671,97 @@ static void db_detect_and_send_thread_entry(void *parameter)
         // Acquire mutex before modifying shared data
         if (g_db_mutex) rt_mutex_take(g_db_mutex, RT_WAITING_FOREVER);
 
-        // Add to history ring buffer
+        // Add to history ring buffer (only store in internal array, not the global one yet)
         g_db_history[g_db_history_index] = current_db;
         g_db_history_index = (g_db_history_index + 1) % DB_HISTORY_SIZE;
 
         // Release mutex
         if (g_db_mutex) rt_mutex_release(g_db_mutex);
 
-        // Prepare message string (e.g., "dB: -45.23")
-        char msg_str[64];
-        snprintf(msg_str, sizeof(msg_str), "dB: %.2f", current_db);
+        // Send data every 10 seconds regardless of how many samples collected
+        if (rt_tick_get() - last_send_tick >= rt_tick_from_millisecond(10000)) {
+            // Prepare message string containing all 10 seconds of data
+            char msg_str[512]; // Increased buffer size to accommodate multiple dB values
+            strcpy(msg_str, "dB_history: ");
 
-        // Send UDP packet
-        ssize_t sent = sendto(sockfd, msg_str, strlen(msg_str), 0,
-                              (struct sockaddr*)&serv_addr, sizeof(serv_addr));
-        if (sent < 0) {
-            LOG_E("db: sendto failed, errno=%d", errno);
-        } else {
-            LOG_D("db: sent UDP: %s", msg_str); // Debug log
+            char temp_buf[32];
+            int offset = strlen(msg_str);
+
+            // Copy the last 10 dB values to send (use positive index calculation)
+            for (int i = 0; i < DB_HISTORY_SIZE; i++) {
+                // Fix: use positive index to avoid negative modulo issue
+                int idx = (g_db_history_index - DB_HISTORY_SIZE + i);
+                if (idx < 0) idx += DB_HISTORY_SIZE;
+                idx = idx % DB_HISTORY_SIZE;
+                float db_val = g_db_history[idx];
+                if (db_val < -900.0f) {  // 检查是否为初始值
+                    db_val = -999.0f;  // 或者跳过这个值
+                }
+                if (i == 0) {
+                    snprintf(temp_buf, sizeof(temp_buf), "%.2f", db_val);
+                } else {
+                    snprintf(temp_buf, sizeof(temp_buf), ",%.2f", db_val);
+                }
+
+                if (offset + strlen(temp_buf) >= sizeof(msg_str) - 1) break;
+
+                strcpy(&msg_str[offset], temp_buf);
+                offset += strlen(temp_buf);
+            }
+
+            // Send UDP packet with all 10 seconds of data
+            ssize_t sent = sendto(sockfd, msg_str, strlen(msg_str), 0,
+                                  (struct sockaddr*)&serv_addr, sizeof(serv_addr));
+            if (sent < 0) {
+                LOG_E("db: sendto failed, errno=%d", errno);
+            } else {
+                LOG_I("db: sent UDP batch: %s", msg_str); // Info log for batch sending
+            }
+
+            // Update last send time
+            last_send_tick = rt_tick_get();
         }
 
         // Reset temp buffer index for next iteration
         temp_idx = 0;
+    }
+
+    // Send any remaining data in buffer when thread exits
+    {
+        // Prepare message string containing all dB values in buffer
+        char msg_str[512];
+        strcpy(msg_str, "dB_history: ");
+
+        char temp_buf[32];
+        int offset = strlen(msg_str);
+
+        // Copy all dB values in the history buffer
+        for (int i = 0; i < DB_HISTORY_SIZE; i++) {
+            int idx = (g_db_history_index - DB_HISTORY_SIZE + i);
+            if (idx < 0) idx += DB_HISTORY_SIZE;
+            idx = idx % DB_HISTORY_SIZE;
+            float db_val = g_db_history[idx];
+
+            if (i == 0) {
+                snprintf(temp_buf, sizeof(temp_buf), "%.2f", db_val);
+            } else {
+                snprintf(temp_buf, sizeof(temp_buf), ",%.2f", db_val);
+            }
+
+            if (offset + strlen(temp_buf) >= sizeof(msg_str) - 1) break;
+
+            strcpy(&msg_str[offset], temp_buf);
+            offset += strlen(temp_buf);
+        }
+
+        // Send remaining UDP packet
+        ssize_t sent = sendto(sockfd, msg_str, strlen(msg_str), 0,
+                              (struct sockaddr*)&serv_addr, sizeof(serv_addr));
+        if (sent < 0) {
+            LOG_E("db: sendto failed for remaining data, errno=%d", errno);
+        } else {
+            LOG_I("db: sent UDP remaining: %s", msg_str);
+        }
     }
 
     close(sockfd);
@@ -963,7 +1037,9 @@ int meow_get_db_history(float* buffer, int size) {
     rt_mutex_take(g_db_mutex, RT_WAITING_FOREVER);
 
     int copy_count = (size < DB_HISTORY_SIZE) ? size : DB_HISTORY_SIZE;
-    int start_index = (g_db_history_index - copy_count + DB_HISTORY_SIZE) % DB_HISTORY_SIZE;
+    // Fix: use positive index to avoid negative modulo issue
+    int start_index = g_db_history_index - copy_count;
+    if (start_index < 0) start_index += DB_HISTORY_SIZE;
 
     for (int i = 0; i < copy_count; i++) {
         int src_idx = (start_index + i) % DB_HISTORY_SIZE;
